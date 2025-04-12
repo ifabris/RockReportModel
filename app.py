@@ -5,10 +5,11 @@ import joblib
 from sklearn.ensemble import RandomForestRegressor
 import plotly.graph_objects as go
 from scipy.interpolate import griddata
+from sklearn.metrics import pairwise_distances_argmin_min
 from io import BytesIO
 
-st.set_page_config(page_title="Cu 3D Prediction Volume Generator", layout="wide")
-st.title("🧠 Copper Prediction Volume Generator")
+st.set_page_config(page_title="3D Prediction Volume Generator", layout="wide")
+st.title("Prediction Volume Generator")
 
 st.markdown("""
 Upload your `collars.xlsx` and `assays.xlsx` files. The app will train a model and generate a volumetric 3D heatmap (ore body style) of predicted values for the selected element.
@@ -35,13 +36,11 @@ if collar_file and assay_file:
     assays.columns = assays.columns.str.strip()
     clean_col_map = {col: col.lower().replace('(m)', '').strip() for col in assays.columns}
 
-    # Clean up all object-type columns (e.g. Cu = "<0.01")
     for col in assays.columns:
         if assays[col].dtype == object:
             assays[col] = assays[col].astype(str).str.replace('<', '', regex=False)
             assays[col] = pd.to_numeric(assays[col], errors='coerce')
 
-    # Map important fields
     column_map = {
         "from": next((col for col, clean in clean_col_map.items() if "from" in clean), None),
         "to": next((col for col, clean in clean_col_map.items() if "to" in clean and "total" not in clean), None),
@@ -52,14 +51,12 @@ if collar_file and assay_file:
         st.error("❌ Couldn't detect 'From', 'To', or 'BHID' columns. Please check your assay file.")
         st.stop()
 
-    # Rename to standardized
     assays = assays.rename(columns={
         column_map["from"]: "From",
         column_map["to"]: "To",
         column_map["bhid"]: "BHID"
     })
 
-    # Get true element columns by filtering out structural ones
     excluded_keywords = ["from", "to", "length", "bhid"]
     element_options = [
         col for col in assays.select_dtypes(include=[np.number]).columns
@@ -140,25 +137,46 @@ if collar_file and assay_file:
         opacity=0.9
     ))
 
-    # Drillhole orientation
-    arrow_length = 25
-    for _, row in collars.iterrows():
-        dip_rad = np.radians(row['Dip'])
-        az_rad = np.radians(row['Azimuth'])
-        x0, y0, z0 = row['Easting'], row['Northing'], row['Elevation']
-        x1 = x0 + arrow_length * np.cos(dip_rad) * np.sin(az_rad)
-        y1 = y0 + arrow_length * np.cos(dip_rad) * np.cos(az_rad)
-        z1 = z0 - arrow_length * np.sin(dip_rad)
+    # ✅ Drillhole Intervals (Real Segments)
+    def interval_to_xyz(row):
+        dip_rad = np.radians(row["Dip"])
+        azm_rad = np.radians(row["Azimuth"])
+        x0 = row["Easting"] + row["From"] * np.cos(dip_rad) * np.sin(azm_rad)
+        y0 = row["Northing"] + row["From"] * np.cos(dip_rad) * np.cos(azm_rad)
+        z0 = row["Elevation"] - row["From"] * np.sin(dip_rad)
+        x1 = row["Easting"] + row["To"] * np.cos(dip_rad) * np.sin(azm_rad)
+        y1 = row["Northing"] + row["To"] * np.cos(dip_rad) * np.cos(azm_rad)
+        z1 = row["Elevation"] - row["To"] * np.sin(dip_rad)
+        return pd.Series([x0, y0, z0, x1, y1, z1])
 
+    merged[["x0", "y0", "z0", "x1", "y1", "z1"]] = merged.apply(interval_to_xyz, axis=1)
+
+    for _, row in merged.iterrows():
         fig.add_trace(go.Scatter3d(
-            x=[x0, x1], y=[y0, y1], z=[z0, z1],
-            mode='lines+markers+text',
-            line=dict(color='red', width=3),
-            marker=dict(size=3, color='blue'),
-            name=row['BHID'],
-            text=[row['BHID'], ''],
-            hoverinfo='text'
+            x=[row.x0, row.x1], y=[row.y0, row.y1], z=[row.z0, row.z1],
+            mode='lines',
+            line=dict(
+                color=row[selected_element], width=3,
+                colorscale='Hot',
+                cmin=vmin, cmax=vmax
+            ),
+            hovertext=f"{row['BHID']}\n{selected_element}: {row[selected_element]:.1f}",
+            hoverinfo='text',
+            showlegend=False
         ))
+
+    # ✅ Target Suggestion (Furthest high predictions)
+    _, dists = pairwise_distances_argmin_min(grid_df[["Easting", "Northing", "Elevation"]], merged[["Easting", "Northing", "Elevation"]])
+    grid_df['dist'] = dists
+    targets = grid_df.sort_values(by=[f"Predicted_{selected_element}", 'dist'], ascending=[False, False]).head(10)
+
+    fig.add_trace(go.Scatter3d(
+        x=targets['Easting'], y=targets['Northing'], z=targets['Elevation'],
+        mode='markers+text',
+        marker=dict(size=6, color='cyan', symbol='diamond'),
+        text=[f"Suggested Drill (ppm: {val:.1f})" for val in targets[f"Predicted_{selected_element}"]],
+        name="Suggested Drill Points"
+    ))
 
     fig.update_layout(
         title=f"🌍 3D {selected_element} Isosurface Volume with Drillhole Paths",
@@ -173,7 +191,10 @@ if collar_file and assay_file:
 
     st.plotly_chart(fig, use_container_width=True)
 
-    # CSV Export
+    st.markdown("### 📌 Suggested Drill Locations")
+    for i, row in targets.iterrows():
+        st.markdown(f"- **Easting:** {row['Easting']:.2f}, **Northing:** {row['Northing']:.2f}, **Elevation:** {row['Elevation']:.2f}, **{selected_element}:** {row[f'Predicted_{selected_element}']:.2f} ppm")
+
     csv = grid_df.to_csv(index=False).encode("utf-8")
     st.download_button(
         f"📥 Download Predicted {selected_element} CSV",
